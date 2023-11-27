@@ -1,0 +1,5 @@
+.Rproj.user
+
+# Non-github directories
+data/
+results/
