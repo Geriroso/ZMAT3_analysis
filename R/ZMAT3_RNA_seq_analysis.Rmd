@@ -1,0 +1,1100 @@
+---
+title: "ZMAT3_RNA_seq_analysis"
+author:
+- name: "Gerard Romero Sola"
+  affiliation: Cancer Biology Unit - Ana Janic's Lab
+date: "`r Sys.Date()`"
+output:
+   BiocStyle::html_document:
+      toc: true
+      toc_float:
+        collapsed: true
+        smooth_scroll: true
+      toc_depth: 3
+      df_print: paged
+      highlights: pygments
+      number_sections: true
+      fig_captions: yes
+      theme: lumen
+      self_contained: true
+   fig_width: 10
+   fig_height: 10
+bibliography: bibliography.bib
+---
+
+```{css, include=FALSE}
+body {
+  text-align: justify;
+}
+```
+
+```{r setup, echo=FALSE, cache=FALSE}
+suppressPackageStartupMessages(library(knitr)) ## kable()
+knitr::opts_chunk$set(
+  collapse=TRUE,
+  comment="",
+  fig.align="center",
+  cache=FALSE
+)
+options(usethis.quiet=TRUE)
+```
+
+## Loading the packages
+
+```{r load-libraries, warning=FALSE, message=FALSE}
+suppressPackageStartupMessages(library(readr))
+suppressPackageStartupMessages(library(tximport))
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(SummarizedExperiment))
+suppressPackageStartupMessages(library(edgeR))
+suppressPackageStartupMessages(library(DESeq2))
+suppressPackageStartupMessages(library(cancerTiming))
+suppressPackageStartupMessages(library(here))
+suppressPackageStartupMessages(library(mixOmics))
+suppressPackageStartupMessages(library(dendextend))
+suppressPackageStartupMessages(library(sva))
+suppressPackageStartupMessages(library(ggrepel))
+suppressPackageStartupMessages(library(pheatmap))
+suppressPackageStartupMessages(library(EnhancedVolcano))
+suppressPackageStartupMessages(library(GSEABase))
+suppressPackageStartupMessages(library(fgsea))
+suppressPackageStartupMessages(library(org.Mm.eg.db))
+suppressPackageStartupMessages(library(clusterProfiler))
+suppressPackageStartupMessages(library(AnnotationDbi))
+suppressPackageStartupMessages(library(pathview))
+suppressPackageStartupMessages(library(kableExtra))
+suppressPackageStartupMessages(library(vsn))
+suppressPackageStartupMessages(library(hexbin))
+suppressPackageStartupMessages(library(apeglm))
+suppressPackageStartupMessages(library(VennDiagram))
+suppressPackageStartupMessages(library(biomaRt))
+suppressPackageStartupMessages(library(ComplexHeatmap))
+suppressPackageStartupMessages(library(TxDb.Mmusculus.UCSC.mm10.knownGene))
+suppressPackageStartupMessages(library(rafalib))
+```
+
+# Loading the data
+```{r}
+## Creating the data from the phenotypic data
+pdata <- data.frame(
+  SampleName = c("p21KO1","p21KO2","p21KO3","p21KO4","PKO1","PKO2","PKO3","TKO1", "TKO2", "TKO3", "WT1", "WT2", "WT3", "WT4", "ZKO1","ZKO2","ZKO3","ZKO4"),
+  Replicate = as.factor(c(rep(c(1,2,3,4), 1),rep(c(1,2,3),2),rep(c(1,2,3,4), 2))),
+  Condition = as.factor(c(rep("p21KO", 4),rep("PKO", 3),rep("TKO", 3), rep("WT", 4), rep("ZKO", 4))),
+  Sex = as.factor(c("M","F","F","M","F","M","F","F","M","M","F","F","M","M","F","F","M","M")),
+  DOD = as.factor(c("19Apr","19Apr","19Apr","13Jun","19Apr","19Apr","13Jun","21Feb","21Feb","6Jul","21Feb","21Feb","15Jun","15Jun","21Feb","21Feb","21Feb","21Feb"))
+)
+## Paths to the quant files from salmon
+files = here("data","salmon",list.files(path = here("data","salmon"), pattern = "quant.sf", recursive = TRUE))
+names(files) = pdata$SampleName
+tx2gene = read_tsv(file = here("data","salmon","salmon_tx2gene.tsv"),col_names = FALSE )
+```
+
+```{r}
+txi = tximport(files, type = "salmon", tx2gene = tx2gene)
+```
+
+```{r}
+dds = DESeqDataSetFromTximport(txi,
+                               colData = pdata,
+                               design = ~ Condition)
+raw_counts_matrix = as.data.frame(assay(dds)[,c("WT1","WT2","WT3","WT4","ZKO1","ZKO2","ZKO3","ZKO4","TKO1","TKO2","TKO3")]) %>% rownames_to_column("Ensembl_ID")
+write_tsv(raw_counts_matrix, file = here("results","Raw_counts_matrix.txt"))
+```
+
+```{r no-duplicates}
+## Removing the numbers after the dots
+gene_ids <- rownames(dds)
+id_nodot <- gsub("\\..*","",gene_ids)
+paste0("The number of duplicated identifiers are ", sum(duplicated(id_nodot)))
+```
+
+```{r SummarizedExperiment2}
+## Add names to rowData
+rowData(dds)$ensembl_id <- id_nodot
+## Name the assays element as "counts"
+names(assays(dds)) <- c("counts")
+ensembl_to_gene = tx2gene %>%
+  dplyr::select(X2, X3)
+ensembl_to_gene = ensembl_to_gene[order(ensembl_to_gene$X2),]
+ensembl_to_gene = ensembl_to_gene[!duplicated(ensembl_to_gene$X2),]
+ensembl_to_gene = ensembl_to_gene[ensembl_to_gene$X2 %in% gene_ids, ]
+
+## Add gene symbol
+rowData(dds)$gene_symbol = ensembl_to_gene$X3
+```
+
+```{r}
+## Create the DGEList object
+dge <- DGEList(counts=assays(dds)$counts, genes=rowData(dds), group = colData(dds)$Condition)
+dim(dge)
+```
+
+```{r cpm-transform}
+assays(dds)$logCPM <- cpm(dge, log=TRUE)
+summary(assays(dds)$logCPM)
+```
+
+```{r description4}
+head(dge$samples)
+dge$samples$group
+```
+
+```{r libsizes, echo=FALSE, fig.height=10, fig.width=10, out.width="600px", fig.cap="Library sizes in increasing order."}
+ord <- order(dge$sample$lib.size)
+barplot(dge$sample$lib.size[ord]/1e6, las=1, ylim = c(0,50),ylab="Millions of reads",
+        xlab="Samples", col=c("#B24745FF", "#79AF97FF", "#E5D29F")[dds$Condition[ord]])
+legend("topleft", c("TKO", "WT", "ZKO"), fill=c("#B24745FF", "#79AF97FF", "#E5D29F"), inset=0.01)
+```
+
+### Quality control
+
+```{r}
+annotation.library <- read.delim(here("data","Mus_musculus_2023_08_25.gene_info"))
+annotation <- annotation.library[match(dge$genes$gene_symbol, annotation.library$Symbol), ]
+dge$genes = cbind(dge$genes, annotation)
+```
+
+## Filtering
+
+```{r filterLowExpr}
+no.symbol = is.na(dge$genes$Symbol)
+rRNA = dge$genes$type_of_gene == "rRNA"
+IG = grepl("^Ig", dge$genes$Symbol) & dge$genes$type_of_gene != "protein-coding" & grepl("immunoglobulin", dge$genes$description, 
+    ignore.case = TRUE)
+Xist.gene = dge$genes$Symbol == "Xist"
+chrY <- dge$genes$chromosome == "Y"
+rbind(no.symbol = table(no.symbol), rRNA = table(rRNA), IG = table(IG), Xist.gene = table(Xist.gene), chrY = table(chrY))
+mask1 = !(no.symbol | rRNA | IG | Xist.gene | chrY)
+
+dds.filt1 <- dds[mask1, ]
+dim(dds.filt1)
+dge.filt1 <- dge[mask1,, keep.lib.sizes = FALSE]
+dim(dge.filt1)
+mask2 <- filterByExpr(dge.filt1, group=dge$samples$group, min.count=20, min.prop=0.95)
+dds.filt <- dds.filt1[mask2, ]
+dim(dds.filt)
+dge.filt <- dge.filt1[mask2,, keep.lib.sizes = FALSE]
+dim(dge.filt)
+```
+
+```{r}
+dge.filt <- calcNormFactors(dge.filt, method = "TMM")
+head(dge.filt$samples$norm.factors)
+```
+
+Consequently, I will replace the raw log2 CPM units in the corresponding assay element of the `SummarizedExperiment` object, by the normalized ones.
+
+```{r}
+assays(dds.filt)$TMM<- cpm(dge.filt, log=TRUE,
+                              normalized.lib.sizes=TRUE)
+```
+
+### Analysis with sex batch effect
+
+```{r}
+dds.filt <- estimateSizeFactors(dds.filt)
+dat  <- counts(dds.filt, normalized = TRUE)
+idx  <- rowMeans(dat) > 1
+dat  <- dat[idx, ]
+mod  <- model.matrix(~ Condition, colData(dds.filt))
+mod0 <- model.matrix(~ 1, colData(dds.filt))
+svseq <- svaseq(dat, mod, mod0, n.sv = 5)
+```
+
+```{r}
+ddssva <- dds.filt
+ddssva$SV1 <- svseq$sv[,1]
+ddssva$SV2 <- svseq$sv[,2]
+ddssva$SV3 <- svseq$sv[,3]
+ddssva$SV4 <- svseq$sv[,4]
+design(ddssva) <- ~ Condition + Sex + SV1 + SV2
+```
+
+### TKO
+
+#### WT 1,2,3,4
+```{r}
+ddssva.TKO <- ddssva[,ddssva$Condition == "WT" | ddssva$Condition == "TKO"]
+ddssva.TKO$Condition <- droplevels(ddssva.TKO$Condition)
+ddssva.TKO$Condition <- relevel(ddssva.TKO$Condition, "WT")
+```
+
+```{r}
+ddssva.DESeq.TKO <- DESeq(ddssva.TKO)
+```
+```{r}
+tt.DESeq.sva.TKO <- results(ddssva.DESeq.TKO, contrast = c("Condition", "TKO", "WT"), alpha = 0.05)
+tt.DESeq.sva.TKO <- lfcShrink(ddssva.DESeq.TKO, res = tt.DESeq.sva.TKO, coef = "Condition_TKO_vs_WT", type = "apeglm")
+DEgenes.DESeq2.sva.TKO <- setdiff(gsub("\\..*","", rownames(data.frame(tt.DESeq.sva.TKO)[tt.DESeq.sva.TKO$padj < 0.05 & abs(tt.DESeq.sva.TKO$log2FoldChange) > 1.5, ])), c("NA"))
+```
+
+#### Raw p-values distribution
+
+Diagnostics plots for DE analysis:
+
+```{r, fig.width=10, fig.height=10}
+hist(tt.DESeq.sva.TKO$pvalue, xlab="Raw P-values", main="DESeq2 + SVA TKO", las=1)
+abline(1000, 1, lwd=2)
+```
+
+```{r}
+tt.DESeq.sva.TKO_tb <- tt.DESeq.sva.TKO %>%
+  data.frame() %>%
+  rownames_to_column(var="Ensembl_ID_version") %>%
+  as_tibble()
+tt.DESeq.sva.TKO_tb$Ensembl_ID <- gsub("\\..*","",tt.DESeq.sva.TKO_tb$Ensembl_ID_version)
+
+tt.DESeq.sva.TKO_tb <- tt.DESeq.sva.TKO_tb %>%
+  relocate(Ensembl_ID, .after = Ensembl_ID_version)
+```
+
+```{r, fig.width=15, fig.height=15}
+volcano_data.TKO <- as.data.frame(cbind(tt.DESeq.sva.TKO$log2FoldChange, tt.DESeq.sva.TKO$padj))
+rownames(volcano_data.TKO) <- tt.DESeq.sva.TKO_tb$Ensembl_ID
+volcano_data.TKO = volcano_data.TKO %>%
+	rownames_to_column("ensembl_id") %>%
+	dplyr::rename(log2FC = V1, FDR = V2)
+volcano_data.TKO = merge(volcano_data.TKO,rowData(dds), by = "ensembl_id")
+```
+
+```{r, fig.width=10, fig.height=12}
+keyvals <- ifelse(
+    abs(volcano_data.TKO$log2FC) > 1.5 & volcano_data.TKO$FDR < 0.05, 'red',
+        ifelse(volcano_data.TKO$FDR < 0.05,"blue",'grey'))
+names(keyvals)[keyvals == 'red'] <- 'up-regulated or down_regulated'
+names(keyvals)[keyvals == 'grey'] <- 'ns'
+names(keyvals)[keyvals == 'blue'] <- 'p.adj'
+keyvals <- ifelse(
+    abs(volcano_data.TKO$log2FC) > 1.5 & volcano_data.TKO$FDR < 0.05, 'red',
+        'grey')
+names(keyvals)[keyvals == 'red'] <- 'up-regulated or down_regulated'
+names(keyvals)[keyvals == 'grey'] <- 'ns'
+
+
+
+
+top_10_DEGs = volcano_data.TKO$gene_symbol[order(volcano_data.TKO$FDR, decreasing = FALSE)][1:10]
+selected_genes = c("Klf4","Trb1","Cebpb","Sik1","Hexim1","Jun","Arc", "Dusp1","Dusp5","Fos","Rgs2","Spry1","Plk2","Zfp36l2","Rnps1","Zmat3")
+
+selected_genes = c(selected_genes,top_10_DEGs)
+
+Volcano_TKO = EnhancedVolcano(volcano_data.TKO,
+    lab = volcano_data.TKO$gene_symbol, selectLab = selected_genes,
+    colAlpha = 0.9,
+    colCustom = keyvals,
+    x = 'log2FC', y = 'FDR', pCutoff = 0.05, FCcutoff=1.5, labSize = 6, 
+    legendPosition = "nonr",
+    legendLabels = c('Not sig.','log2 FC','p.adj',
+      'p.adj & log2 FC'),
+    title = "",
+    subtitle = "",
+    boxedLabels = FALSE,
+    parseLabels = TRUE,
+    labFace = 'bold',
+    cutoffLineWidth = 1,
+    drawConnectors = TRUE,
+    widthConnectors = 0.3,
+    cutoffLineType = "longdash",
+    caption = "",
+    colConnectors = 'black',
+    gridlines.major = FALSE, gridlines.minor = FALSE
+    ) 
+#+ scale_y_break(c(50,150))
+```
+
+```{r, fig.height=10, fig.width=10}
+pdf(file = here("results","new","Volcano_TKO_sex_corrected_WT1234.pdf"), width = 10, height = 12)
+Volcano_TKO
+dev.off()
+```
+
+```{r}
+# Excel of DEGs
+tx2gene_ensembl_symbol = tx2gene %>%
+  dplyr::select(c(X2, X3)) %>%
+  dplyr::rename(Ensembl_ID_version = X2, Symbol = X3) %>%
+  dplyr::distinct(Ensembl_ID_version, Symbol)
+tt.TKO = merge(tt.DESeq.sva.TKO_tb, tx2gene_ensembl_symbol, by = "Ensembl_ID_version") %>%
+  drop_na(padj) %>%
+  relocate(Symbol, .after = Ensembl_ID) %>% 
+  dplyr::arrange(c(log2FoldChange))
+write_tsv(tt.TKO, file = here("results","new","List_of_expressed_genes_TKO_sex_corrected_WT1234.tsv"), col_names = TRUE)
+```
+
+```{r, fig.height=12}
+# Heatmap of DEGs
+expression_TMM_df = as.data.frame(assays(dds.filt)$TMM[,c("WT1","WT2","WT3","WT4","TKO1","TKO2","TKO3")]) %>%
+  rownames_to_column(var = "Ensembl_ID_version")
+expression_TMM_df = merge(expression_TMM_df, tx2gene_ensembl_symbol, by = "Ensembl_ID_version") %>%
+  relocate(Symbol, .after = Ensembl_ID_version) %>%
+  mutate(ENSEMBL = gsub("\\..*","",Ensembl_ID_version))
+rownames(expression_TMM_df) = NULL
+
+DEgenes.DESeq2.sva.TKO_symbol = expression_TMM_df %>%
+  filter(ENSEMBL %in% DEgenes.DESeq2.sva.TKO) %>%
+  pull(Symbol)
+
+row_ordering = tt.TKO %>%
+  filter(Symbol %in% DEgenes.DESeq2.sva.TKO_symbol) %>%
+  arrange(desc(log2FoldChange)) %>%
+  pull(Symbol)
+up_or_down = tt.TKO %>%
+  filter(Symbol %in% DEgenes.DESeq2.sva.TKO_symbol) %>%
+  arrange(desc(log2FoldChange)) %>%
+  mutate(up_or_down = if_else(log2FoldChange > 1.5, "UP","DOWN")) %>%
+  pull(up_or_down)
+
+mat = expression_TMM_df[expression_TMM_df$Symbol %in% DEgenes.DESeq2.sva.TKO_symbol,c("Symbol","WT1","WT2","WT3","WT4","TKO1","TKO2","TKO3")]
+  rownames(mat) = NULL
+  mat = mat %>% column_to_rownames("Symbol") %>% as.matrix
+
+  matS <- t(apply(mat, 1, scale))
+  colnames(matS) = c("WT1","WT2","WT3","WT4","TKO1","TKO2","TKO3")
+
+ordering_df = data.frame(row_order = factor(row_ordering, levels = row_ordering), up_or_down = factor(up_or_down, levels = c("UP","DOWN")))
+
+# Change order
+kclus <- kmeans(mat, 2)
+split <- factor(paste0("Cluster", kclus$cluster), levels=c("Cluster\n1","Cluster\n2"))
+  heatmap_plot = ComplexHeatmap::pheatmap(matS, 
+          row_order = row_ordering,
+          show_rownames = TRUE,
+          show_colnames = TRUE,
+          cluster_rows = FALSE,
+          cluster_cols = FALSE,
+          color = brewer.pal(9,"PRGn"),
+          name = "TMM",
+          column_names_side = c("top"),
+          angle_col = c("0"))
+  pdf(file = here("results","new","DEGs_heatmap_TKO_vs_WT1234_sex_corrected.pdf"), height = 12)
+  heatmap_plot
+  dev.off()
+```
+
+```{r}
+set.seed(999)
+ego.DEGs.TKO <- enrichGO(
+  DEgenes.DESeq2.sva.TKO,
+  "ENSEMBL",
+  universe = rowData(dds)$ensembl_id,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  minGSSize = 5,
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+write_tsv(as.data.frame(ego.DEGs.TKO), file = here("results","new","GO_terms_DEGs_TKO_sex_corrected_WT1234.tsv"), col_names = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=12, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+ego.DEGs.TKO_terms = as.data.frame(ego.DEGs.TKO) %>%
+  filter(Count < 5) %>%
+  pull(ID)
+ego.DEGs.TKO <- dropGO(ego.DEGs.TKO, term = ego.DEGs.TKO_terms)
+GO_terms_TKO_DEGs = clusterProfiler::dotplot(ego.DEGs.TKO, showCategory = 15)
+```
+
+```{r, fig.height=10, fig.width=10}
+pdf(file = here("results","new","GO_DEGs_TKO_sex_corrected_WT1234.pdf"), width = 15, height = 15)
+GO_terms_TKO_DEGs
+dev.off()
+```
+### KEGG
+
+```{r}
+genes_oi = read.delim(file = here("data","genes_oi.txt"), header = FALSE)
+ensembl_genes_oi = tt.TKO %>%
+  filter(Symbol %in% genes_oi$V1) %>%
+  pull(Ensembl_ID)
+entrez_ids_oi = as.character(na.omit(mapIds(org.Mm.eg.db, genes_oi$V1, 'ENTREZID', 'SYMBOL')))
+eKegg.DEGs.TKO = enrichKEGG(
+  entrez_ids,
+  organism = "mmu",
+  keyType = "kegg",
+  pvalueCutoff = 1,
+  pAdjustMethod = "BH",
+  universe = rowData(dds)$ensembl_id,
+  minGSSize = 5,
+  maxGSSize = 500,
+  qvalueCutoff = 1,
+  use_internal_data = FALSE
+)
+write_tsv(as.data.frame(ego.DEGs.TKO), file = here("results","new","GO_terms_DEGs_TKO_sex_corrected_WT1234.tsv"), col_names = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=12, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+eKegg.DEGs.TKO_terms = as.data.frame(eKegg.DEGs.TKO) %>%
+  filter(Count < 5) %>%
+  pull(ID)
+eKegg.DEGs.TKO <- dropGO(eKegg.DEGs.TKO, term = eKegg.DEGs.TKO_terms)
+KEGG_terms_TKO_DEGs = clusterProfiler::dotplot(eKegg.DEGs.TKO, showCategory = 15)
+```
+
+```{r, fig.height=10, fig.width=10}
+pdf(file = here("results","new","GO_DEGs_TKO_sex_corrected_WT1234.pdf"), width = 15, height = 15)
+GO_terms_TKO_DEGs
+dev.off()
+```
+
+
+
+### GSEA
+
+```{r}
+GS_hallmark <- getGmt(here("data","mh.all.v2023.1.Mm.symbols.gmt"),  geneIdType=SymbolIdentifier())
+GS_curated <- getGmt(here("data","m2.all.v2023.1.Mm.symbols.gmt"),  geneIdType=SymbolIdentifier())
+ensembl.hallmark <- mapIdentifiers(GS_hallmark, ENSEMBLIdentifier("org.Mm.eg.db"))
+ensembl.curated <- mapIdentifiers(GS_curated, ENSEMBLIdentifier("org.Mm.eg.db"))
+gsc <- GeneSetCollection(c(ensembl.hallmark , ensembl.curated))
+gsets <- geneIds(gsc)
+```
+
+```{r}
+set.seed(999) #The fgsea function is giving different results, so I setted a seed as suggested in: https://github.com/ctlab/fgsea/issues/12
+tt.DESeq.sva.TKO_df <- data.frame(tt.DESeq.sva.TKO)
+sig_tt.DESeq.sva.TKO_df = tt.DESeq.sva.TKO_df[abs(tt.DESeq.sva.TKO_df$log2FoldChange) > 1.5 & tt.DESeq.sva.TKO_df$padj < 0.05, ]
+sig_tt.DESeq.sva.TKO_df = sig_tt.DESeq.sva.TKO_df[gsub("\\..*","", rownames(sig_tt.DESeq.sva.TKO_df)) != "NA", ]
+sig_tt.DESeq.sva.TKO_df$fcsign <- sign(sig_tt.DESeq.sva.TKO_df$log2FoldChange)
+sig_tt.DESeq.sva.TKO_df$logP <- -log10(sig_tt.DESeq.sva.TKO_df$pvalue)
+sig_tt.DESeq.sva.TKO_df$metric <- sig_tt.DESeq.sva.TKO_df$logP/sig_tt.DESeq.sva.TKO_df$fcsign
+stats.DESeq.sva.TKO <- sig_tt.DESeq.sva.TKO_df$metric
+names(stats.DESeq.sva.TKO) <- gsub("\\..*","", rownames(sig_tt.DESeq.sva.TKO_df))
+fgseares.DESeq.sva.TKO <- fgsea(gsets, stats.DESeq.sva.TKO, minSize = 5,nproc = 1)
+fgseares.DESeq.sva.TKO_sig = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$pval < 0.05,]
+```
+
+### With genes_oi
+
+```{r}
+set.seed(999) #The fgsea function is giving different results, so I setted a seed as suggested in: https://github.com/ctlab/fgsea/issues/12
+
+tt.DESeq.sva.TKO_df = data.frame(tt.DESeq.sva.TKO) %>%
+  mutate(Ensembl_ID = gsub("\\..*","", rownames(.))) %>%
+  filter(Ensembl_ID %in% ensembl_genes_oi)
+tt.DESeq.sva.TKO_df$fcsign <- sign(tt.DESeq.sva.TKO_df$log2FoldChange)
+tt.DESeq.sva.TKO_df$logP <- -log10(tt.DESeq.sva.TKO_df$pvalue)
+tt.DESeq.sva.TKO_df$metric <- tt.DESeq.sva.TKO_df$logP/tt.DESeq.sva.TKO_df$fcsign
+stats.DESeq.sva.TKO <- tt.DESeq.sva.TKO_df$metric
+names(stats.DESeq.sva.TKO) <- gsub("\\..*","", rownames(tt.DESeq.sva.TKO_df))
+fgseares.DESeq.sva.TKO <- fgsea(gsets, stats.DESeq.sva.TKO, minSize = 5,nproc = 1)
+fgseares.DESeq.sva.TKO_sig = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$pval < 0.05,]
+```
+
+
+```{r}
+# Tidy results
+fgseaResTidy <- fgseares.DESeq.sva.TKO %>%
+	filter(pval < 0.05) %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+```
+
+```{r, fig.height=10, fig.width=10}
+GSEA_TKO = ggplot(fgseaResTidy, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=pval<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()
+```
+
+```{r, fig.height=10, fig.width=10}
+pdf(file = here("results","new","DEGs_GSEA_TKO.pdf"), width = 10, height = 10)
+GSEA_TKO
+dev.off()
+```
+
+```{r}
+top_10_GO_terms = as.data.frame(ego.DEGs.TKO) %>%
+  arrange(p.adjust) %>%
+  pull(ID)
+top_10_GO_description = as.data.frame(ego.DEGs.TKO) %>%
+  arrange(p.adjust) %>%
+  pull(Description)
+top_10_GO_terms = top_10_GO_terms[1:10]
+top_10_GO_description = top_10_GO_description[1:10]
+ego.DEGs.TKO_df = as.data.frame(ego.DEGs.TKO)
+ego.DEGs.TKO_df_top10 = ego.DEGs.TKO_df[ego.DEGs.TKO_df$ID %in% top_10_GO_terms,]
+expression_TMM_df = as.data.frame(assays(dds.filt)$TMM[,c("WT1","WT2","WT3","WT4","TKO1","TKO2","TKO3")]) %>%
+  rownames_to_column(var = "Ensembl_ID_version")
+expression_TMM_df = merge(expression_TMM_df, tx2gene_ensembl_symbol, by = "Ensembl_ID_version") %>%
+  relocate(Symbol, .after = Ensembl_ID_version)
+rownames(expression_TMM_df) = NULL
+for(term in top_10_GO_terms){
+genes_in_term = unlist(strsplit(ego.DEGs.TKO_df[ego.DEGs.TKO_df$ID == term,"geneID"], "/"))
+  mat = expression_TMM_df[expression_TMM_df$Symbol %in% genes_in_term,c("Symbol","WT1","WT2","WT3","WT4","TKO1","TKO2","TKO3")]
+  rownames(mat) = NULL
+  mat = mat %>% column_to_rownames("Symbol") %>% as.matrix
+  heatmap_plot = ComplexHeatmap::pheatmap(mat, 
+          scale = "row",
+          show_rownames = TRUE,
+          show_colnames = TRUE,
+          cluster_rows = TRUE,
+          cluster_cols = FALSE,
+          color = brewer.pal(9,"PRGn"),
+          cutree_rows = 2,
+          treeheight_row = 10,
+          name = "TMM",
+          column_names_side = c("top"),
+          angle_col = c("0"))
+  pdf(file = here("results","new","TOP_10_GO_heatmaps",paste0(term,".pdf")))
+  heatmap_plot
+  dev.off()
+}
+```
+
+
+## ZKO vs TKO
+### DESeq2 + SVA
+
+```{r}
+ddssva.TKO.ZKO <- ddssva[,ddssva$Condition == "TKO" | ddssva$Condition == "ZKO"]
+ddssva.TKO.ZKO$Condition <- droplevels(ddssva.TKO.ZKO$Condition)
+ddssva.TKO.ZKO$Condition <- relevel(ddssva.TKO.ZKO$Condition, "ZKO")
+```
+
+```{r}
+ddssva.DESeq.TKO.ZKO <- DESeq(ddssva.TKO.ZKO)
+```
+
+```{r}
+tt.DESeq.sva.TKO.ZKO <- results(ddssva.DESeq.TKO.ZKO, contrast = c("Condition", "TKO", "ZKO"), alpha = 0.05)
+tt.DESeq.sva.TKO.ZKO <- lfcShrink(ddssva.DESeq.TKO.ZKO, res = tt.DESeq.sva.TKO.ZKO, coef = "Condition_TKO_vs_ZKO", type = "apeglm")
+DEgenes.DESeq2.sva.TKO.ZKO <- setdiff(gsub("\\..*","", rownames(data.frame(tt.DESeq.sva.TKO.ZKO)[tt.DESeq.sva.TKO.ZKO$padj < 0.05 & abs(tt.DESeq.sva.TKO.ZKO$log2FoldChange) > 1.5, ])), c("NA"))
+```
+
+#### Raw p-values distribution
+
+Diagnostics plots for DE analysis:
+
+```{r, fig.width=10, fig.height=10}
+hist(tt.DESeq.sva.TKO.ZKO$pvalue, xlab="Raw P-values", main="DESeq2 + SVA TKO vs ZKO", las=1)
+abline(1000, 1, lwd=2)
+```
+
+```{r}
+tt.DESeq.sva.TKO.ZKO_tb <- tt.DESeq.sva.TKO.ZKO %>%
+  data.frame() %>%
+  rownames_to_column(var="Ensembl_ID_version") %>%
+  as_tibble()
+tt.DESeq.sva.TKO.ZKO_tb$Ensembl_ID <- gsub("\\..*","",tt.DESeq.sva.TKO.ZKO_tb$Ensembl_ID_version)
+
+tt.DESeq.sva.TKO.ZKO_tb <- tt.DESeq.sva.TKO.ZKO_tb %>%
+  relocate(Ensembl_ID, .after = Ensembl_ID_version)
+```
+
+```{r, fig.width=15, fig.height=15}
+volcano_data.TKO.ZKO <- as.data.frame(cbind(tt.DESeq.sva.TKO.ZKO$log2FoldChange, tt.DESeq.sva.TKO.ZKO$padj))
+rownames(volcano_data.TKO.ZKO) <- tt.DESeq.sva.TKO.ZKO_tb$Ensembl_ID
+volcano_data.TKO.ZKO = volcano_data.TKO.ZKO %>%
+	rownames_to_column("ensembl_id") %>%
+	dplyr::rename(log2FC = V1, FDR = V2)
+volcano_data.TKO.ZKO = merge(volcano_data.TKO.ZKO,rowData(dds), by = "ensembl_id")
+```
+
+```{r, fig.width=15, fig.height=15}
+keyvals <- ifelse(
+    abs(volcano_data.TKO.ZKO$log2FC) > 1.5 & volcano_data.TKO.ZKO$FDR < 0.05, 'red',
+        ifelse(volcano_data.TKO.ZKO$FDR < 0.05,"blue",'grey'))
+names(keyvals)[keyvals == 'red'] <- 'up-regulated or down_regulated'
+names(keyvals)[keyvals == 'grey'] <- 'ns'
+names(keyvals)[keyvals == 'blue'] <- 'p.adj'
+
+keyvals <- ifelse(
+    abs(volcano_data.TKO.ZKO$log2FC) > 1.5 & volcano_data.TKO.ZKO$FDR < 0.05, 'red',
+        'grey')
+names(keyvals)[keyvals == 'red'] <- 'up-regulated or down_regulated'
+names(keyvals)[keyvals == 'grey'] <- 'ns'
+
+top_10_DEGs = volcano_data.TKO.ZKO$gene_symbol[order(volcano_data.TKO.ZKO$FDR, decreasing = FALSE) & abs(volcano_data.TKO.ZKO$log2FC) > 1.5][1:20]
+
+Volcano_TKO.ZKO = EnhancedVolcano(volcano_data.TKO.ZKO,
+    lab = volcano_data.TKO.ZKO$gene_symbol, selectLab = top_10_DEGs,
+    colAlpha = 0.9,
+    colCustom = keyvals,
+    x = 'log2FC', y = 'FDR', pCutoff = 0.05, FCcutoff=1.5, labSize = 6, 
+    legendPosition = "nonr",
+    legendLabels = c('Not sig.','log2 FC','p.adj',
+      'p.adj & log2 FC'),
+    title = "",
+    subtitle = "",
+    boxedLabels = FALSE,
+    parseLabels = TRUE,
+    labFace = 'bold',
+    cutoffLineWidth = 1,
+    drawConnectors = TRUE,
+    widthConnectors = 0.3,
+    cutoffLineType = "longdash",
+    caption = "",
+    colConnectors = 'black',
+    gridlines.major = FALSE, gridlines.minor = FALSE
+    ) 
+#+ scale_y_break(c(50,150))
+```
+
+```{r, fig.height=10, fig.width=10}
+pdf(file = here("results","new","Volcano_TKO_vs_ZKO_sex_corrected_WT1234.pdf"), width = 10, height = 12)
+Volcano_TKO.ZKO
+dev.off()
+```
+
+```{r}
+# Excel of DEGs
+tx2gene_ensembl_symbol = tx2gene %>%
+  dplyr::select(c(X2, X3)) %>%
+  dplyr::rename(Ensembl_ID_version = X2, Symbol = X3) %>%
+  dplyr::distinct(Ensembl_ID_version, Symbol)
+tt.TKO.ZKO = merge(tt.DESeq.sva.TKO.ZKO_tb, tx2gene_ensembl_symbol, by = "Ensembl_ID_version") %>%
+  drop_na(padj) %>%
+  relocate(Symbol, .after = Ensembl_ID) %>% 
+  dplyr::arrange(c(log2FoldChange))
+write_tsv(tt.TKO.ZKO, file = here("results","new","List_of_expressed_genes_TKO_vs_ZKO_sex_corrected_WT1234.tsv"), col_names = TRUE)
+```
+
+```{r}
+# Heatmap of DEGs
+
+  mat = expression_TMM_df[expression_TMM_df$Symbol %in% genes_in_term,c("Symbol","WT1","WT2","WT3","WT4","TKO1","TKO2","TKO3")]
+  rownames(mat) = NULL
+  mat = mat %>% column_to_rownames("Symbol") %>% as.matrix
+  heatmap_plot = ComplexHeatmap::pheatmap(mat, 
+          scale = "row",
+          show_rownames = TRUE,
+          show_colnames = TRUE,
+          cluster_rows = TRUE,
+          cluster_cols = FALSE,
+          color = brewer.pal(9,"PRGn"),
+          cutree_rows = 2,
+          treeheight_row = 10,
+          name = "TMM",
+          column_names_side = c("top"),
+          angle_col = c("0"))
+  pdf(file = here("results","new","TOP_10_GO_heatmaps",paste0(term,".pdf")))
+  heatmap_plot
+  dev.off()
+```
+
+```{r}
+set.seed(999)
+ego.DEGs.TKO.ZKO <- enrichGO(
+  DEgenes.DESeq2.sva.TKO.ZKO,
+  "ENSEMBL",
+  universe = rowData(dds)$ensembl_id,
+  OrgDb = org.Mm.eg.db,
+  ont = "BP",
+  pAdjustMethod = "BH",
+  minGSSize = 5,
+  qvalueCutoff = 0.05,
+  readable = TRUE)
+write_tsv(as.data.frame(ego.DEGs.TKO.ZKO), file = here("results","new","GO_terms_DEGs_TKO_vs_ZKO_sex_corrected_WT1234.tsv"), col_names = TRUE)
+```
+
+```{r dotplot, fig.width=8, fig.height=12, message=FALSE, warning=FALSE}
+# Dotplot of top 25
+ego.DEGs.TKO.ZKO_terms = as.data.frame(ego.DEGs.TKO.ZKO) %>%
+  filter(Count < 5) %>%
+  pull(ID)
+ego.DEGs.TKO.ZKO <- dropGO(ego.DEGs.TKO.ZKO, term = ego.DEGs.TKO.ZKO_terms)
+GO_terms_TKO.ZKO_DEGs = clusterProfiler::dotplot(ego.DEGs.TKO.ZKO, showCategory = 15)
+```
+
+```{r, fig.height=10, fig.width=10}
+pdf(file = here("results","new","GO_DEGs_TKO_vs_ZKO_sex_corrected_WT1234.pdf"), width = 15, height = 15)
+GO_terms_TKO.ZKO_DEGs
+dev.off()
+```
+
+### GSEA
+
+```{r}
+GS_hallmark <- getGmt(here("data","mh.all.v2023.1.Mm.symbols.gmt"),  geneIdType=SymbolIdentifier())
+GS_curated <- getGmt(here("data","m2.all.v2023.1.Mm.symbols.gmt"),  geneIdType=SymbolIdentifier())
+ensembl.hallmark <- mapIdentifiers(GS_hallmark, ENSEMBLIdentifier("org.Mm.eg.db"))
+ensembl.curated <- mapIdentifiers(GS_curated, ENSEMBLIdentifier("org.Mm.eg.db"))
+gsc <- GeneSetCollection(c(ensembl.hallmark , ensembl.curated))
+gsets <- geneIds(gsc)
+```
+
+```{r}
+set.seed(999) #The fgsea function is giving different results, so I setted a seed as suggested in: https://github.com/ctlab/fgsea/issues/12
+tt.DESeq.sva.TKO.ZKO_df <- data.frame(tt.DESeq.sva.TKO.ZKO)
+sig_tt.DESeq.sva.TKO.ZKO_df = tt.DESeq.sva.TKO.ZKO_df[abs(tt.DESeq.sva.TKO.ZKO_df$log2FoldChange) > 1.5 & tt.DESeq.sva.TKO.ZKO_df$padj < 0.05, ]
+sig_tt.DESeq.sva.TKO.ZKO_df = sig_tt.DESeq.sva.TKO.ZKO_df[gsub("\\..*","", rownames(sig_tt.DESeq.sva.TKO.ZKO_df)) != "NA", ]
+sig_tt.DESeq.sva.TKO.ZKO_df$fcsign <- sign(sig_tt.DESeq.sva.TKO.ZKO_df$log2FoldChange)
+sig_tt.DESeq.sva.TKO.ZKO_df$logP <- -log10(sig_tt.DESeq.sva.TKO.ZKO_df$pvalue)
+sig_tt.DESeq.sva.TKO.ZKO_df$metric <- sig_tt.DESeq.sva.TKO.ZKO_df$logP/sig_tt.DESeq.sva.TKO.ZKO_df$fcsign
+stats.DESeq.sva.TKO.ZKO <- sig_tt.DESeq.sva.TKO.ZKO_df$metric
+names(stats.DESeq.sva.TKO.ZKO) <- gsub("\\..*","", rownames(sig_tt.DESeq.sva.TKO.ZKO_df))
+fgseares.DESeq.sva.TKO.ZKO <- fgsea(gsets, stats.DESeq.sva.TKO.ZKO, minSize = 5,nproc = 1)
+fgseares.DESeq.sva.TKO.ZKO_sig = fgseares.DESeq.sva.TKO.ZKO[fgseares.DESeq.sva.TKO.ZKO$padj < 0.05 & fgseares.DESeq.sva.TKO.ZKO$NES >1,]
+```
+
+```{r}
+# Tidy results
+fgseaResTidy <- fgseares.DESeq.sva.TKO.ZKO %>%
+	filter(pval < 0.05) %>%
+  as_tibble() %>%
+  arrange(desc(NES))
+```
+
+```{r, fig.height=10, fig.width=10}
+GSEA_TKO.ZKO = ggplot(fgseaResTidy, aes(reorder(pathway, NES), NES)) +
+  geom_col(aes(fill=pval<0.05)) +
+  coord_flip() +
+  labs(x="Pathway", y="Normalized Enrichment Score",
+       title="Hallmark pathways NES from GSEA") + 
+  theme_minimal()
+```
+
+```{r, fig.height=10, fig.width=10}
+pdf(file = here("results","new","DEGs_GSEA_TKO_vs_ZKO.pdf"), width = 10, height = 10)
+GSEA_TKO.ZKO
+dev.off()
+```
+
+## Analysis of GS
+
+```{r}
+# Load the Gene set
+gene_sets = list.files(path = here("data","GSEA_gene_sets"),pattern = ".gmt",full.names = TRUE)
+list_of_gs = c()
+for(path in gene_sets){
+GS <- getGmt(path,  geneIdType=SymbolIdentifier())
+ensembl = mapIdentifiers(GS, ENSEMBLIdentifier("org.Mm.eg.db"))
+list_of_gs = c(list_of_gs,ensembl)
+}
+gsc <- GeneSetCollection(list_of_gs)
+gsets <- geneIds(gsc)
+```
+
+### With genes_oi
+
+```{r}
+set.seed(999) #The fgsea function is giving different results, so I setted a seed as suggested in: https://github.com/ctlab/fgsea/issues/12
+
+tt.DESeq.sva.TKO_df = data.frame(tt.DESeq.sva.TKO) %>%
+  mutate(Ensembl_ID = gsub("\\..*","", rownames(.))) %>%
+  filter(Ensembl_ID %in% ensembl_genes_oi)
+tt.DESeq.sva.TKO_df$fcsign <- sign(tt.DESeq.sva.TKO_df$log2FoldChange)
+tt.DESeq.sva.TKO_df$logP <- -log10(tt.DESeq.sva.TKO_df$pvalue)
+tt.DESeq.sva.TKO_df$metric <- tt.DESeq.sva.TKO_df$logP/tt.DESeq.sva.TKO_df$fcsign
+stats.DESeq.sva.TKO <- tt.DESeq.sva.TKO_df$metric
+names(stats.DESeq.sva.TKO) <- gsub("\\..*","", rownames(tt.DESeq.sva.TKO_df))
+fgseares.DESeq.sva.TKO <- fgsea(gsets, stats.DESeq.sva.TKO, minSize = 5,nproc = 1)
+fgseares.DESeq.sva.TKO_sig = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$padj < 0.05 & fgseares.DESeq.sva.TKO$NES >1,]
+```
+
+
+```{r}
+set.seed(999) #The fgsea function is giving different results, so I setted a seed as suggested in: https://github.com/ctlab/fgsea/issues/12
+
+tt.DESeq.sva.TKO_df = data.frame(tt.DESeq.sva.TKO)
+sig_tt.DESeq.sva.TKO_df = tt.DESeq.sva.TKO_df[abs(tt.DESeq.sva.TKO_df$log2FoldChange) > 1.5 & tt.DESeq.sva.TKO_df$padj < 0.05, ]
+sig_tt.DESeq.sva.TKO_df = sig_tt.DESeq.sva.TKO_df[gsub("\\..*","", rownames(sig_tt.DESeq.sva.TKO_df)) != "NA", ]
+
+sig_tt.DESeq.sva.TKO_df$fcsign <- sign(sig_tt.DESeq.sva.TKO_df$log2FoldChange)
+sig_tt.DESeq.sva.TKO_df$logP <- -log10(sig_tt.DESeq.sva.TKO_df$pvalue)
+sig_tt.DESeq.sva.TKO_df$metric <- sig_tt.DESeq.sva.TKO_df$logP/sig_tt.DESeq.sva.TKO_df$fcsign
+stats.DESeq.sva.TKO <- sig_tt.DESeq.sva.TKO_df$metric
+names(stats.DESeq.sva.TKO) <- gsub("\\..*","", rownames(sig_tt.DESeq.sva.TKO_df))
+fgseares.DESeq.sva.TKO <- fgsea(gsets, stats.DESeq.sva.TKO, minSize = 5,nproc = 1)
+fgseares.DESeq.sva.TKO_sig = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$padj < 0.05 & fgseares.DESeq.sva.TKO$NES >1,]
+```
+
+```{r, fig.width=15}
+gsea_MARTINEZ_TP53_TARGETS_UP = plotEnrichment(gsets$MARTINEZ_TP53_TARGETS_UP, stats.DESeq.sva.TKO) +
+  theme(axis.text = element_text(size=16))
+```
+
+```{r}
+pdf(file = here("results","new","gsea_MARTINEZ_TP53_TARGETS_UP.pdf"), width = 15, height = 10)
+gsea_MARTINEZ_TP53_TARGETS_UP
+dev.off()
+```
+
+#### Exploring the GSEA plotting
+```{r}
+gseaParam = 1
+ticksSize = 0.2
+rnk <- rank(-stats.DESeq.sva.TKO)
+ord <- order(rnk)
+statsAdj <- stats.DESeq.sva.TKO[ord]
+statsAdj <- sign(statsAdj) * (abs(statsAdj)^gseaParam)
+statsAdj <- statsAdj/max(abs(statsAdj))
+pathway <- unname(as.vector(na.omit(match(gsets$MARTINEZ_TP53_TARGETS_UP, names(statsAdj)))))
+    pathway <- sort(pathway)
+    gseaRes <- calcGseaStat(statsAdj, selectedStats = pathway, 
+        returnAllExtremes = TRUE)
+    bottoms <- gseaRes$bottoms
+    tops <- gseaRes$tops
+    n <- length(statsAdj)
+    xs <- as.vector(rbind(pathway - 1, pathway))
+    ys <- as.vector(rbind(bottoms, tops))
+    toPlot <- data.frame(x = c(0, xs, n + 1), y = c(0, ys, 0))
+    diff <- (max(tops) - min(bottoms))/8
+    x = y = NULL
+    g <- ggplot(toPlot, aes(x = x, y = y)) + geom_point(color = "green", 
+        size = 0.1) + geom_hline(yintercept = max(tops), colour = "red", 
+        linetype = "dashed") + geom_hline(yintercept = min(bottoms), 
+        colour = "red", linetype = "dashed") + geom_hline(yintercept = 0, 
+        colour = "black") + geom_line(color = "green") + theme_bw() + 
+        geom_segment(data = data.frame(x = pathway), mapping = aes(x = x, 
+            y = -diff/2, xend = x, yend = diff/2), size = ticksSize) + 
+        theme(panel.border = element_blank(), panel.grid.minor = element_blank()) + 
+        labs(x = "rank", y = "enrichment score")
+    g
+```
+
+#### Adjust variables for GSEA plot
+```{r}
+options(digits = 3)
+enrichment.score.range = c(min(ys), max(ys))
+gsea.gene.set = "MARTINEZ_TP53_TARGETS_UP"
+gsea.enrichment.score = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$pathway == gsea.gene.set,]$ES
+gsea.p.value = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$pathway == gsea.gene.set,]$pval
+gsea.fdr = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$pathway == gsea.gene.set,]$padj
+gsea.normalized.enrichment.score = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$pathway == gsea.gene.set,]$NES
+gsea.hit.indices = xs
+metric.range <- c(min(stats.DESeq.sva.TKO), max(stats.DESeq.sva.TKO))
+class.name = "DEGs"
+gsea.template = "a"
+gsea.metric = "None"
+```
+
+
+## Create GSEA plot
+```{r}
+pdf(file = here("results","new","gsea_MARTINEZ_TP53_TARGETS_UP_full_plot.pdf"), width = 5, height = 7)
+  # Save default for resetting
+  def.par <- par(no.readonly = TRUE)
+  
+  # Create a new device of appropriate size
+  #dev.new(width = 10, height = 3)
+  
+  # Create a division of the device
+  gsea.layout <- layout(matrix(c(1, 2, 3, 4)), heights = c(1.7, 0.5, 0.2, 2))
+  layout.show(gsea.layout)
+  
+  # Create plots
+  par(mar = c(0, 5, 2, 2))
+  plot(toPlot$x, toPlot$y, type = "l", col = "red", lwd = 1.5, xaxt = "n",
+       xaxs = "i", xlab = "", ylab = "Enrichment score (ES)",
+       ylim = enrichment.score.range,
+       main = list(gsea.gene.set, font = 1, cex = 1),
+       panel.first = {
+          abline(h = seq(round(enrichment.score.range[1], digits = 1),
+                         enrichment.score.range[2], 0.1),
+                 col = "gray95", lty = 2)
+         abline(h = 0, col = "gray50", lty = 2)
+       })
+  plot.coordinates <- par("usr")
+  if(gsea.enrichment.score < 0) {
+    text(length(stats.DESeq.sva.TKO) * 0.01, plot.coordinates[3] * 0.98,
+         paste("Nominal p-value:", gsea.p.value, "\nES:",
+               gsea.enrichment.score, "\nNormalized ES:",
+               gsea.normalized.enrichment.score), adj = c(0, 0))
+  } else {
+    text(length(stats.DESeq.sva.TKO) * 0.99, plot.coordinates[4] - ((plot.coordinates[4] - plot.coordinates[3]) * 0.03),
+         paste("Nominal p-value:", round(gsea.p.value,4), "\nES:",
+               round(gsea.enrichment.score,4), "\nNormalized ES:",
+               round(gsea.normalized.enrichment.score,4), "\n"), adj = c(1, 1))
+  }
+  
+  par(mar = c(0, 5, 0, 2))
+  plot(0, type = "n", xaxt = "n", xaxs = "i", xlab = "", yaxt = "n",
+       ylab = "", xlim = c(1, length(stats.DESeq.sva.TKO)))
+  abline(v = gsea.hit.indices, lwd = 0.75)
+  
+  par(mar = c(0, 5, 0, 2))
+  rank.colors <- stats.DESeq.sva.TKO[ord] - metric.range[1]
+  rank.colors <- rank.colors / (metric.range[2] - metric.range[1])
+  rank.colors <- ceiling(rank.colors * 255 + 1)
+  tryCatch({
+    rank.colors <- colorRampPalette(c("blue", "white", "red"))(256)[rank.colors]
+  }, error = function(e) {
+    stop("Please use the metric.range argument to provide a metric range that",
+         "includes all metric values")
+  })
+  # Use rle to prevent too many objects
+  rank.colors <- rle(rank.colors)
+  barplot(matrix(rank.colors$lengths), col = rank.colors$values, border = NA, horiz = TRUE, xaxt = "n", xlim = c(1, length(stats.DESeq.sva.TKO)))
+  box()
+  text(length(stats.DESeq.sva.TKO) / 2, 0.7,
+       labels = ifelse(!missing(class.name), class.name, gsea.template))
+  text(length(stats.DESeq.sva.TKO) * 0.01, 0.7, "Overexpressed", adj = c(0, NA))
+  text(length(stats.DESeq.sva.TKO) * 0.99, 0.7, "Underexpressed", adj = c(1, NA))
+  
+  par(mar = c(5, 5, 0, 2))
+  rank.metric <- rle(round(stats.DESeq.sva.TKO[ord], digits = 2))
+  plot(stats.DESeq.sva.TKO[ord], type = "n", xaxs = "i",
+	     xlab = "Rank in ordered gene list", xlim = c(0, length(stats.DESeq.sva.TKO)),
+	     ylim = metric.range, yaxs = "i",
+	     ylab = if(gsea.metric == "None") {"Ranking metric"} else {gsea.metric},
+	     panel.first = abline(h = seq(metric.range[1] / 2,
+	                                  metric.range[2] - metric.range[1] / 4,
+	                                  metric.range[2] / 2), col = "gray95", lty = 2))
+
+  barplot(as.vector(rank.metric$values), col = "lightgrey", lwd = 0.1, xaxs = "i",
+       xlab = "Rank in ordered gene list", xlim = c(0, length(stats.DESeq.sva.TKO)),
+       ylim = c(-1, 1), yaxs = "i", width = rank.metric$lengths, border = NA,
+       ylab = ifelse(gsea.metric == "None", "Ranking metric", gsea.metric), space = 0, add = TRUE)
+  box()
+  
+  # Reset to default
+  par(def.par)
+dev.off()
+```
+
+### GSEA with 
+
+```{r}
+GS_hallmark <- getGmt(here("data","mh.all.v2023.1.Mm.symbols.gmt"),  geneIdType=SymbolIdentifier())
+GS_curated <- getGmt(here("data","m2.all.v2023.1.Mm.symbols.gmt"),  geneIdType=SymbolIdentifier())
+ensembl.hallmark <- mapIdentifiers(GS_hallmark, ENSEMBLIdentifier("org.Mm.eg.db"))
+ensembl.curated <- mapIdentifiers(GS_curated, ENSEMBLIdentifier("org.Mm.eg.db"))
+gsc <- GeneSetCollection(c(ensembl.hallmark , ensembl.curated))
+gsets <- geneIds(gsc)
+```
+
+```{r}
+set.seed(999) #The fgsea function is giving different results, so I setted a seed as suggested in: https://github.com/ctlab/fgsea/issues/12
+tt.DESeq.sva.TKO_df <- data.frame(tt.DESeq.sva.TKO)
+sig_tt.DESeq.sva.TKO_df = tt.DESeq.sva.TKO_df[abs(tt.DESeq.sva.TKO_df$log2FoldChange) > 1.5 & tt.DESeq.sva.TKO_df$padj < 0.05, ]
+sig_tt.DESeq.sva.TKO_df = sig_tt.DESeq.sva.TKO_df[gsub("\\..*","", rownames(sig_tt.DESeq.sva.TKO_df)) != "NA", ]
+sig_tt.DESeq.sva.TKO_df$fcsign <- sign(sig_tt.DESeq.sva.TKO_df$log2FoldChange)
+sig_tt.DESeq.sva.TKO_df$logP <- -log10(sig_tt.DESeq.sva.TKO_df$pvalue)
+sig_tt.DESeq.sva.TKO_df$metric <- sig_tt.DESeq.sva.TKO_df$logP/sig_tt.DESeq.sva.TKO_df$fcsign
+stats.DESeq.sva.TKO <- sig_tt.DESeq.sva.TKO_df$metric
+names(stats.DESeq.sva.TKO) <- gsub("\\..*","", rownames(sig_tt.DESeq.sva.TKO_df))
+fgseares.DESeq.sva.TKO <- fgsea(gsets, stats.DESeq.sva.TKO, minSize = 5,nproc = 1)
+fgseares.DESeq.sva.TKO_sig = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$pval < 0.05,]
+```
+
+#### Exploring the GSEA plotting
+```{r}
+for(gs in fgseares.DESeq.sva.TKO_sig$pathway){
+gseaParam = 1
+ticksSize = 0.2
+rnk <- rank(-stats.DESeq.sva.TKO)
+ord <- order(rnk)
+statsAdj <- stats.DESeq.sva.TKO[ord]
+statsAdj <- sign(statsAdj) * (abs(statsAdj)^gseaParam)
+statsAdj <- statsAdj/max(abs(statsAdj))
+pathway <- unname(as.vector(na.omit(match(gsets[[gs]], names(statsAdj)))))
+    pathway <- sort(pathway)
+    gseaRes <- calcGseaStat(statsAdj, selectedStats = pathway, 
+        returnAllExtremes = TRUE)
+    bottoms <- gseaRes$bottoms
+    tops <- gseaRes$tops
+    n <- length(statsAdj)
+    xs <- as.vector(rbind(pathway - 1, pathway))
+    ys <- as.vector(rbind(bottoms, tops))
+    toPlot <- data.frame(x = c(0, xs, n + 1), y = c(0, ys, 0))
+    diff <- (max(tops) - min(bottoms))/8
+    x = y = NULL
+    g <- ggplot(toPlot, aes(x = x, y = y)) + geom_point(color = "green", 
+        size = 0.1) + geom_hline(yintercept = max(tops), colour = "red", 
+        linetype = "dashed") + geom_hline(yintercept = min(bottoms), 
+        colour = "red", linetype = "dashed") + geom_hline(yintercept = 0, 
+        colour = "black") + geom_line(color = "green") + theme_bw() + 
+        geom_segment(data = data.frame(x = pathway), mapping = aes(x = x, 
+            y = -diff/2, xend = x, yend = diff/2), size = ticksSize) + 
+        theme(panel.border = element_blank(), panel.grid.minor = element_blank()) + 
+        labs(x = "rank", y = "enrichment score")
+
+options(digits = 3)
+enrichment.score.range = c(min(ys), max(ys))
+gsea.gene.set = gs
+gsea.enrichment.score = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$pathway == gsea.gene.set,]$ES
+gsea.p.value = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$pathway == gsea.gene.set,]$pval
+gsea.fdr = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$pathway == gsea.gene.set,]$padj
+gsea.normalized.enrichment.score = fgseares.DESeq.sva.TKO[fgseares.DESeq.sva.TKO$pathway == gsea.gene.set,]$NES
+gsea.hit.indices = xs
+metric.range <- c(min(stats.DESeq.sva.TKO), max(stats.DESeq.sva.TKO))
+class.name = "DEGs"
+gsea.template = "a"
+gsea.metric = "None"
+pdf(file = here("results","new",paste0(gs,"_full_plot.pdf")), width = 5, height = 4)
+  # Save default for resetting
+  def.par <- par(no.readonly = TRUE)
+  
+  # Create a new device of appropriate size
+  #dev.new(width = 10, height = 3)
+  
+  # Create a division of the device
+  gsea.layout <- layout(matrix(c(1, 2, 3, 4)), heights = c(1.7, 0.5, 0.2, 2))
+  layout.show(gsea.layout)
+  
+  # Create plots
+  par(mar = c(0, 5, 2, 2))
+  plot(toPlot$x, toPlot$y, type = "l", col = "red", lwd = 1.5, xaxt = "n",
+       xaxs = "i", xlab = "", ylab = "Enrichment score (ES)",
+       ylim = enrichment.score.range,
+       main = list(gsea.gene.set, font = 1, cex = 1),
+       panel.first = {
+          abline(h = seq(round(enrichment.score.range[1], digits = 1),
+                         enrichment.score.range[2], 0.1),
+                 col = "gray95", lty = 2)
+         abline(h = 0, col = "gray50", lty = 2)
+       })
+  plot.coordinates <- par("usr")
+  if(gsea.enrichment.score < 0) {
+    text(length(stats.DESeq.sva.TKO) * 0.01, plot.coordinates[3] * 0.98,
+         paste("Nominal p-value:", gsea.p.value, "\nES:",
+               gsea.enrichment.score, "\nNormalized ES:",
+               gsea.normalized.enrichment.score), adj = c(0, 0))
+  } else {
+    text(length(stats.DESeq.sva.TKO) * 0.99, plot.coordinates[4] - ((plot.coordinates[4] - plot.coordinates[3]) * 0.03),
+         paste("Nominal p-value:", round(gsea.p.value,4), "\nES:",
+               round(gsea.enrichment.score,4), "\nNormalized ES:",
+               round(gsea.normalized.enrichment.score,4), "\n"), adj = c(1, 1))
+  }
+  
+  par(mar = c(0, 5, 0, 2))
+  plot(0, type = "n", xaxt = "n", xaxs = "i", xlab = "", yaxt = "n",
+       ylab = "", xlim = c(1, length(stats.DESeq.sva.TKO)))
+  abline(v = gsea.hit.indices, lwd = 0.75)
+  
+  par(mar = c(0, 5, 0, 2))
+  rank.colors <- stats.DESeq.sva.TKO[ord] - metric.range[1]
+  rank.colors <- rank.colors / (metric.range[2] - metric.range[1])
+  rank.colors <- ceiling(rank.colors * 255 + 1)
+  tryCatch({
+    rank.colors <- colorRampPalette(c("blue", "white", "red"))(256)[rank.colors]
+  }, error = function(e) {
+    stop("Please use the metric.range argument to provide a metric range that",
+         "includes all metric values")
+  })
+  # Use rle to prevent too many objects
+  rank.colors <- rle(rank.colors)
+  barplot(matrix(rank.colors$lengths), col = rank.colors$values, border = NA, horiz = TRUE, xaxt = "n", xlim = c(1, length(stats.DESeq.sva.TKO)))
+  box()
+  text(length(stats.DESeq.sva.TKO) / 2, 0.7,
+       labels = ifelse(!missing(class.name), class.name, gsea.template))
+  text(length(stats.DESeq.sva.TKO) * 0.01, 0.7, "Overexpressed", adj = c(0, NA))
+  text(length(stats.DESeq.sva.TKO) * 0.99, 0.7, "Underexpressed", adj = c(1, NA))
+  
+  par(mar = c(5, 5, 0, 2))
+  rank.metric <- rle(round(stats.DESeq.sva.TKO[ord], digits = 2))
+  plot(stats.DESeq.sva.TKO[ord], type = "n", xaxs = "i",
+	     xlab = "Rank in ordered gene list", xlim = c(0, length(stats.DESeq.sva.TKO)),
+	     ylim = metric.range, yaxs = "i",
+	     ylab = if(gsea.metric == "None") {"Ranking metric"} else {gsea.metric},
+	     panel.first = abline(h = seq(metric.range[1] / 2,
+	                                  metric.range[2] - metric.range[1] / 4,
+	                                  metric.range[2] / 2), col = "gray95", lty = 2))
+
+  barplot(as.vector(rank.metric$values), col = "lightgrey", lwd = 0.1, xaxs = "i",
+       xlab = "Rank in ordered gene list", xlim = c(0, length(stats.DESeq.sva.TKO)),
+       ylim = c(-1, 1), yaxs = "i", width = rank.metric$lengths, border = NA,
+       ylab = ifelse(gsea.metric == "None", "Ranking metric", gsea.metric), space = 0, add = TRUE)
+  box()
+  
+  # Reset to default
+  par(def.par)
+dev.off()
+}
+```
+
